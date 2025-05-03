@@ -1,0 +1,26 @@
+{
+  "telegram": {
+    "bot_token": "123456:ABCdefGhIJKlmNoPQRstuVWXyz",
+    "default_chat_id": "-1001234567890",
+    "use_emojis": true
+  },
+  "check_interval_seconds": 60,
+  "logging_enabled": true,
+  "file_logging_enabled": false,
+  "start_minimized": false,
+  "cut_text": "From:",
+  "folders": [
+    {
+      "name": "Входящие",
+      "chat_id": "-1001234567891",
+      "message_length": 0
+    },
+    {
+      "name": "Zabbix",
+      "chat_id": "-1001234567892",
+      "message_length": 500
+    }
+  ],
+  "ip": "127.0.0.1",
+  "port": 9999
+}
