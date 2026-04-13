@@ -11,6 +11,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -33,6 +34,7 @@ import (
 	"github.com/go-ole/go-ole/oleutil"
 	"github.com/scjalliance/comshim"
 	"github.com/shirou/gopsutil/process"
+	"golang.org/x/net/proxy"
 	"golang.org/x/sys/windows/svc/eventlog"
 )
 
@@ -44,20 +46,41 @@ type Config struct {
 		DefaultChatID string `json:"default_chat_id"`
 		UseEmojis     bool   `json:"use_emojis"`
 	} `json:"telegram"`
-	CheckIntervalSeconds int      `json:"check_interval_seconds"`
-	LoggingEnabled       bool     `json:"logging_enabled"`      // Логирование в приложение
-	FileLoggingEnabled   bool     `json:"file_logging_enabled"` // Логирование в файл
-	StartMinimized       bool     `json:"start_minimized"`      // Запуск программы в трее
-	CutText              string   `json:"cut_text"`
-	Folders              []Folder `json:"folders"`
-	IP                   string   `json:"ip"`
-	Port                 int      `json:"port"`
+	Proxy                ProxyConfig `json:"proxy"`
+	CheckIntervalSeconds int         `json:"check_interval_seconds"`
+	LoggingEnabled       bool        `json:"logging_enabled"`      // Логирование в приложение
+	FileLoggingEnabled   bool        `json:"file_logging_enabled"` // Логирование в файл
+	StartMinimized       bool        `json:"start_minimized"`      // Запуск программы в трее
+	CutText              string      `json:"cut_text"`
+	Folders              []Folder    `json:"folders"`
+	IP                   string      `json:"ip"`
+	Port                 int         `json:"port"`
+}
+
+type ProxyConfig struct {
+	Enabled  bool     `json:"enabled"`
+	Type     string   `json:"type"` // "http", "https", "socks5"
+	Host     string   `json:"host"` // IP или домен
+	Port     int      `json:"port"`
+	Username string   `json:"username,omitempty"`
+	Password string   `json:"password,omitempty"`
+	NoProxy  []string `json:"no_proxy,omitempty"`
 }
 
 type Folder struct {
 	Name          string `json:"name"`
 	ChatID        string `json:"chat_id"`
 	MessageLength int    `json:"message_length"`
+}
+
+// Глобальный клиент (инициализируется при старте)
+var httpClient *http.Client
+
+// Инициализация клиента после загрузки конфига
+func initHTTPClient(cfg Config) error {
+	var err error
+	httpClient, err = NewHTTPClientWithProxy(cfg.Proxy)
+	return err
 }
 
 var (
@@ -335,7 +358,7 @@ func main() {
 	}
 
 	// Пишем версию программы
-	logMessage("Версия программы 1.05")
+	logMessage("Версия программы 1.06")
 
 	// Проверяем значения IP и Port
 	// logMessage(fmt.Sprintf("IP из конфигурации: %s", config.IP))
@@ -348,6 +371,16 @@ func main() {
 			logMessage(fmt.Sprintf("Ошибка при запуске HTTP-сервера: %v", err))
 		}
 	})
+
+	// Инициализация HTTP-клиента с прокси
+	if err := initHTTPClient(config); err != nil {
+		log.Fatalf("Ошибка инициализации HTTP-клиента: %v", err)
+	}
+
+	// Проверка доступа к боту
+	if err := checkBotAccess(config.Telegram.BotToken); err != nil {
+		logMessage("Нет доступа к Telegram боту: %v", err)
+	}
 
 	// Запускаем трей-иконку в отдельной горутине
 	// logMessage("Запуск трей-иконки...")
@@ -645,11 +678,6 @@ func validateConfig() error {
 		return fmt.Errorf("Некорректный BotToken")
 	}
 
-	// Проверка доступа к боту
-	if err := checkBotAccess(config.Telegram.BotToken); err != nil {
-		return fmt.Errorf("Нет доступа к Telegram боту: %v", err)
-	}
-
 	// Проверка DefaultChatID
 	if !isValidChatID(config.Telegram.DefaultChatID) {
 		return fmt.Errorf("Некорректный DefaultChatID")
@@ -713,6 +741,30 @@ func validateConfig() error {
 		return fmt.Errorf("Port должен быть в диапазоне от 1024 до 49151")
 	}
 
+	// Проверка Proxy (если включен)
+	if config.Proxy.Enabled {
+		// Тип прокси
+		validTypes := map[string]bool{"http": true, "https": true, "socks5": true}
+		if !validTypes[config.Proxy.Type] {
+			return fmt.Errorf("неподдерживаемый тип прокси: %s (допустимы: http, https, socks5)", config.Proxy.Type)
+		}
+
+		// Host
+		if config.Proxy.Host == "" {
+			return fmt.Errorf("proxy.host не может быть пустым при включенном прокси")
+		}
+
+		// Port
+		if config.Proxy.Port < 1 || config.Proxy.Port > 65535 {
+			return fmt.Errorf("proxy.port должен быть в диапазоне 1-65535, получено: %d", config.Proxy.Port)
+		}
+
+		// Если есть пароль, должен быть и логин (опционально, но логично)
+		if config.Proxy.Password != "" && config.Proxy.Username == "" {
+			return fmt.Errorf("proxy: пароль указан, но логин пустой")
+		}
+	}
+
 	return nil
 }
 
@@ -738,7 +790,7 @@ func isValidChatID(chatID string) bool {
 func checkBotAccess(botToken string) error {
 	// Проверка доступа к боту через API Telegram
 	url := fmt.Sprintf("https://api.telegram.org/bot%s/getMe", botToken)
-	resp, err := http.Get(url)
+	resp, err := httpClient.Get(url) // ← Используем клиент с прокси
 	if err != nil {
 		return fmt.Errorf("ошибка HTTP-запроса: %v", err)
 	}
@@ -1218,8 +1270,6 @@ func sendTelegramMessage(text, chatID string) error {
 }
 
 func postJSON(url string, data interface{}) ([]byte, error) {
-	client := &http.Client{Timeout: httpTimeout}
-
 	jsonData, err := json.Marshal(data)
 	if err != nil {
 		return nil, fmt.Errorf("ошибка маршалинга JSON: %v", err)
@@ -1231,7 +1281,7 @@ func postJSON(url string, data interface{}) ([]byte, error) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := client.Do(req)
+	resp, err := httpClient.Do(req) // ← Используем клиент с прокси
 	if err != nil {
 		return nil, fmt.Errorf("ошибка выполнения запроса: %v", err)
 	}
@@ -1255,4 +1305,114 @@ func waitNextCheck() {
 		interval = 10
 	}
 	time.Sleep(time.Duration(interval) * time.Second)
+}
+
+// Создаёт http.Client с поддержкой HTTP/HTTPS/SOCKS5 прокси
+func NewHTTPClientWithProxy(cfg ProxyConfig) (*http.Client, error) {
+
+	// Логирование статуса прокси
+	if cfg.Enabled {
+		authInfo := ""
+		if cfg.Username != "" {
+			authInfo = " (с авторизацией)"
+		}
+		logMessage("Прокси включен: %s://%s:%d%s",
+			cfg.Type, cfg.Host, cfg.Port, authInfo)
+	} else {
+		logMessage("Прокси выключен: используется прямое подключение")
+	}
+
+	// Если прокси выключен — возвращаем обычный клиент
+	if !cfg.Enabled {
+		return &http.Client{Timeout: 30 * time.Second}, nil
+	}
+
+	// Создаём базовый транспорт
+	transport := &http.Transport{
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+
+	// Настройка прокси в зависимости от типа
+	switch cfg.Type {
+	case "http", "https":
+		// === HTTP/HTTPS прокси ===
+		// Используем стандартный механизм http.Transport.Proxy
+		proxyURL := &url.URL{
+			Scheme: "http", // Всегда "http" для HTTP-прокси, даже если целевой сайт https
+			Host:   fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
+		}
+
+		// Добавляем авторизацию, если есть
+		if cfg.Username != "" {
+			proxyURL.User = url.UserPassword(cfg.Username, cfg.Password)
+		}
+
+		// Устанавливаем прокси в транспорт
+		transport.Proxy = http.ProxyURL(proxyURL)
+
+		// Настройка обхода прокси (no_proxy)
+		if len(cfg.NoProxy) > 0 {
+			transport.Proxy = func(req *http.Request) (*url.URL, error) {
+				// Проверяем список no_proxy
+				for _, host := range cfg.NoProxy {
+					if req.URL.Hostname() == host || net.ParseIP(req.URL.Hostname()).IsLoopback() {
+						return nil, nil // Не использовать прокси
+					}
+				}
+				// Иначе — использовать прокси
+				return proxyURL, nil
+			}
+		}
+
+		logMessage("HTTP-прокси настроен: %s:%d", cfg.Host, cfg.Port)
+
+	case "socks5":
+		// === SOCKS5 прокси ===
+		auth := (*proxy.Auth)(nil)
+		if cfg.Username != "" {
+			auth = &proxy.Auth{
+				User:     cfg.Username,
+				Password: cfg.Password,
+			}
+		}
+
+		dialer, err := proxy.SOCKS5("tcp",
+			fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
+			auth,
+			proxy.Direct)
+		if err != nil {
+			logMessage("Ошибка настройки SOCKS5-прокси: %v", err)
+			return nil, fmt.Errorf("ошибка настройки SOCKS5-прокси: %w", err)
+		}
+
+		// Устанавливаем кастомный dialer в транспорт
+		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			// Обход прокси для no_proxy
+			host, _, err := net.SplitHostPort(addr)
+			if err == nil {
+				for _, noProxy := range cfg.NoProxy {
+					if host == noProxy || net.ParseIP(host).IsLoopback() {
+						return (&net.Dialer{}).DialContext(ctx, network, addr)
+					}
+				}
+			}
+			return dialer.Dial(network, addr)
+		}
+
+		logMessage("SOCKS5-прокси настроен: %s:%d", cfg.Host, cfg.Port)
+
+	default:
+		err := fmt.Errorf("неподдерживаемый тип прокси: %s", cfg.Type)
+		logMessage("%v", err)
+		return nil, err
+	}
+
+	logMessage("HTTP-клиент инициализирован (таймаут: 30с)")
+
+	return &http.Client{
+		Transport: transport,
+		Timeout:   30 * time.Second,
+	}, nil
 }
